@@ -20,11 +20,15 @@ from math import *
 import os
 from skimage.measure import compare_mse
 from skimage.transform import probabilistic_hough_line
+from skimage.morphology import skeletonize
 import pickle
+import networkx as nx
 
 from py2neo import Node, Relationship, Graph
 graph = Graph("bolt://localhost:7687",auth=("neo4j","redberry"))
 graph.delete_all()
+
+G = nx.Graph()
 
 
 # Mapping from image text to
@@ -167,7 +171,7 @@ class ADWiringDiagram():
         self.border_image = np.array(self.image_rgb.crop(region))
 
 
-    def get_lines(self, img: IMAGE) -> (LINES, LINES, list):
+    def get_lines(self, img: IMAGE) -> (LINES, list):
         # Function that grabs all the lines from
         # the image
         Threshold1 = 150
@@ -181,70 +185,17 @@ class ADWiringDiagram():
         kernel = np.ones((5,5), np.uint8)
         erode = cv2.erode(img, kernel, iterations=1)
 
-        # # Dilate back to thicken the lines
-        # dilate = cv2.dilate(erode, kernel, iterations=2)
+        ret, thresh = cv2.threshold(erode,1,255,cv2.THRESH_BINARY)
+        thresh = (thresh / 255).astype(np.uint8)
+        skeleton = skeletonize(thresh).astype(np.uint8) * 255
 
-        # # bilateral filter to sharpen edges
-        # median = cv2.bilateralFilter(dilate,9,75,75)
-
-        # Computes edges
-        # edges = cv2.Canny(img, Threshold1, Threshold2, FilterSize)
-
-        # Grabs the lines
-        # lines = cv2.HoughLinesP(edges,rho = 1,theta = 1*np.pi/180,threshold = 100,minLineLength = 100,maxLineGap = 50)
-        temp_lines = probabilistic_hough_line(erode,threshold=100,line_length=100,line_gap=50)
+        temp_lines = probabilistic_hough_line(skeleton,threshold=45,line_length=30,line_gap=50)
         lines = []
         for l in temp_lines:
             lines.append( np.array(l).reshape((1,4)).astype(np.int32) )
         lines = np.array(lines)
 
-        # Loop through lines and discard those that represent the other
-        # side of image line
-        for i in range(len(lines) - 1):
-            start = tuple(lines[i].ravel()[0:2])
-            end = tuple(lines[i].ravel()[2:4])
-
-            deg = line2_angle( (start,end) )
-
-            if i in filt_indices:
-                continue
-
-            for i2 in range(len(lines) - 1):
-                if i2 == i or i2 in filt_indices:
-                    continue
-
-                start_ = tuple(lines[i2].ravel()[0:2])
-                end_ = tuple(lines[i2].ravel()[2:4])
-
-                deg2 = line2_angle( (start_,end_) )
-
-                deg_diff = abs( deg - deg2 )
-                if ( ( (start[0] - start_[0])**2 + (start[1] - start_[1])**2 )**(1/2) ) < space_threshold and deg_diff < 10:
-                    filt_indices.append(i2)
-                    continue
-
-        filt_lines = np.delete(lines, filt_indices, 0)
-
-        def centerScore(elem):
-            start, end = elem.ravel().reshape((2,2))
-            xoff, yoff = ( (end - start) / 2 ).astype(int)
-            center = ( start + np.array([xoff,yoff]) )
-            cscore = center.sum()
-            return cscore
-            # return elem.ravel()[0]
-
-        temp_lines = sorted(filt_lines, key=centerScore)
-        thresh = 60
-
-        temp_indices = []
-        for index in range(len(temp_lines) - 4):
-            for i in [1,2,3,4]:
-                total_diff1 = np.abs( (temp_lines[index] - temp_lines[index+i]) ).sum()
-                if total_diff1 < thresh:
-                    temp_indices.append(index)
-
-        final_lines = np.delete(temp_lines,temp_indices, 0)
-        return lines, final_lines
+        return lines
 
     def get_contours(self, img: IMAGE) -> (CONTOURS, CENTERS):
         # Given an image, this function gets all of the contours
@@ -460,6 +411,7 @@ class ADWiringDiagram():
                     else:
                         ecu_map[i] = (closest_ecu, text_near)
 
+
         return ecu_map, list(set(line_colors))
 
 
@@ -467,8 +419,13 @@ class ADWiringDiagram():
         # Function that takes in wire lines and builds the
         # relationship beween ecus/modules
 
+        # Create nodes for each ecu and outward/inward
+        for k,v in mapping.items():
+            val = v[1].replace("\n\n","\n")
+            G.add_node(val)
+
         # Get line information
-        scratch, lines = self.get_lines(img)
+        lines = self.get_lines(img)
 
         # Get line image
         lines_plot = self.plot_lines(lines)
@@ -479,24 +436,16 @@ class ADWiringDiagram():
 
         # Add the black circle boxes to list of boxes
         boxes2 = corners2_boxes(np.array(self.circle_centers), circles=True)
-        corners_filt = []
-        for b in boxes2:
-            for i,c in enumerate(corners):
-                if is_inside(c.ravel(), b):
-                     corners_filt.append(i)
-
-        corners = np.delete(corners, corners_filt, 0)
 
         # Convert corners to bounding boxes
         boxes1 = corners2_boxes(corners)
-        boxes = boxes1
-
-        boxes.extend(boxes2)
+        boxes = boxes1.copy()
 
         box_votes, line_votes = voting(lines, boxes)
         start_lines = get_starts(box_votes)
 
         used_indices = []
+        used_boxes = []
         concat_lines = []
         for line_index in start_lines:
 
@@ -519,9 +468,6 @@ class ADWiringDiagram():
             last_line = None
             constructing = True
 
-            multi_line_indices = []
-            multi_line = False
-            multi_line_box = None
             while constructing:
                 line = lines[line_index].ravel().reshape((2,2))
                 box1, box2 = line_votes[line_index]
@@ -532,31 +478,8 @@ class ADWiringDiagram():
                     # At the end of path
                     end_index, se = box_votes[box][0]
                     end = tuple(lines[end_index].reshape((2,2))[se])
-                    if initial_start != end:
-                        concat_lines.append( (initial_start,end) )
-
-                    if multi_line:
-                        if len(multi_line_indices) > 0:
-                            last_line = line_index
-                            line_index = multi_line_indices.pop(0)
-                            used_indices.append(line_index)
-                            last_box = multi_line_box
-                        else:
-                            constructing = False
-                    else:
-                        constructing = False
-
-                elif len(box_votes[box]) > 2:
-                    next_lines = box_votes[box]
-                    for l in next_lines:
-                        if l[0] != last_line:
-                            multi_line_indices.append(l[0])
-                    multi_line_indices = list(set(multi_line_indices))
-                    last_line = line_index
-                    line_index = multi_line_indices.pop(0)
-                    used_indices.append(line_index)
-                    multi_line = True
-                    multi_line_box = box
+                    concat_lines.append( (initial_start,end) )
+                    constructing = False
 
                 else:
                     next_lines = box_votes[box]
@@ -565,38 +488,43 @@ class ADWiringDiagram():
                     used_indices.append(line_index)
 
 
-        # return concat_lines
+        # Add each of the junction boxes to the node mapping
+        # as well as adding them to nodes in the graph
+        count = len(mapping)
+        junction_params = self.get_bound_rects(boxes2)
+        for i,b in enumerate(junction_params):
+            node_name = 'JUNCTION-{}'.format(i)
+            val = ( (b), node_name )
+            G.add_node(node_name)
+            mapping.update({count: val})
+            count += 1
 
         # Map relationships for starts and ends
-        connections = {}
-
         for line in concat_lines:
             start, end = line
             start_text = False
             end_text = False
             for k,v in mapping.items():
                 box = v[0]
-                text = v[1]
+                text = v[1].replace("\n\n","\n")
                 if "OUT" == text.split("-")[0] or "IN" == text.split("-")[0]:
                     exs = (80,30)
+                elif "JUNCTION" == text.split("-")[0]:
+                    exs = (10,10)
                 else:
                     exs = (50,50)
                 if is_connected(start, box, exs):
+                    # print("[+] Start Connect... [ {} ]".format(text))
                     start_text = text
                 elif is_connected(end, box, exs):
+                    # print("[-] End Connect...  [ {} ]".format(text))
                     end_text = text
+             
+                if start_text and end_text:
+                    G.add_edge(start_text,end_text)
+                    break
 
-            if start_text and end_text:
-                if start_text in connections.keys():
-                    connections[start_text].append(end_text)
-                else:
-                    connections[start_text] = [end_text]
-                if end_text in connections.keys():
-                    connections[end_text].append(start_text)
-                else:
-                    connections[end_text] = [start_text]
-
-        return connections
+        return G
 
     def pipeline(type: str):
         # Function that performs a set of operations stopping
