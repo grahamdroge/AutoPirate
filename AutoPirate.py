@@ -481,7 +481,7 @@ def pipeline(directory):
 
         out_nodes = [n for n in g.nodes if "OUT-" in n]
         next_in_nodes = [n for n in h.nodes if "IN-" in n]
-        next_in_nodes = next_in_nodes[:-1]
+        # next_in_nodes = next_in_nodes[:-1]
         if len(out_nodes) != len(next_in_nodes):
             print("")
             print("[-] Length of OUT[{}] and IN[{}] nodes does not match".format(len(out_nodes),len(next_in_nodes)))
