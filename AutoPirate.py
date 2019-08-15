@@ -7,17 +7,13 @@ import sys
 from PIL import Image, ImageOps
 import imutils
 import numpy as np
-import matplotlib.pyplot as plt
-import datetime
-import argparse
-import logging
 from shapedetector import ShapeDetector
 import pytesseract
 import re
 from pdf2image import convert_from_path
 from math import *
 import os
-from skimage.measure import compare_mse
+from skimage.measure import compare_ssim
 from skimage.transform import probabilistic_hough_line
 from skimage.morphology import skeletonize
 import pickle
@@ -30,22 +26,6 @@ import networkx as nx
 G = nx.Graph()
 circle_centers = []
 border = None
-
-# Mapping from image text to
-# color masks
-Line_Map = {
-    "ORG":    [105,255,255],
-    "BLK":    [0,0,0],
-    "VIO":    [150,255,255],
-    "GRN":    [67,255,167],
-    "BLU":    [0,0,255],
-    "GRY":    [0,0,187],
-    "BRN":    [98,255,128],
-    "WHT":    [0,0,84],
-    "RED":    [120,255,255],
-    "YEL":    [54,95,67],
-}
-
 
 
 def bw_filter(img,rtype="gray"):
@@ -232,10 +212,12 @@ def plot_lines(shape,lines,se=False):
 def extract_text(img):
     # Function to extract text boxes, line colors and decipher
     # text using ocr engine
+    global G
 
     # Grab digit images and load them into array
     # Compute and store histograms for each image
     digits = pickle.load(open("digits.p",'rb'))
+    digits2 = pickle.load(open("digits2.p",'rb'))
 
     # Shape detector to tell the shape of contour
     sd = ShapeDetector()
@@ -257,7 +239,6 @@ def extract_text(img):
 
     # Convert to gray and filter out the colored wires
     # so it is just text
-    # no_boxes = cv2.cvtColor(no_boxes, cv2.COLOR_BGR2GRAY)
     just_text = bw_filter(no_boxes, rtype='rgb')
 
     # Add circle boxes for later relationship building
@@ -291,7 +272,6 @@ def extract_text(img):
 
     # Decipher/Filter text and store mappings to
     # center and bounding rectangle
-    line_colors = []
     ecu_map = {}
     decoded_text = []
     brgb = Image.fromarray(img, 'RGB')
@@ -307,22 +287,19 @@ def extract_text(img):
         text = pytesseract.image_to_string(text_roi)
 
         if lc_check(text):
-            temp = text.split('/')
-            if temp[0] == "BLK":
-                c = temp[1]
-            else:
-                c = temp[0]
+            pass
 
-            line_colors.append(c)
         elif len(text) == 0 and (.65 < ar < 1.25):
             text_roi = text_roi.resize((100,80)).convert('L')
 
-            best_score = 100000
+            best_score = 0
             best_index = 0
             for i2,d in enumerate(digits):
-                mse = compare_mse(d,np.array(text_roi))
-                if mse < best_score:
-                    best_score = mse
+                cmp_score = compare_ssim(d,np.array(text_roi),data_range=d.max()-d.min())
+                cmp_score2 = compare_ssim(digits2[i2],np.array(text_roi),data_range=d.max()-d.min())
+                score = max(cmp_score,cmp_score2)
+                if score > best_score:
+                    best_score = score
                     best_index = i2 + 1
             
             if _roi[0] < (200):
@@ -349,12 +326,13 @@ def extract_text(img):
         val = v[1].replace("\n\n","\n")
         G.add_node(val)
 
-    return ecu_map, list(set(line_colors))
+    return ecu_map
 
 
 def build_relationships(img,mapping):
     # Function that takes in wire lines and builds the
     # relationship beween ecus/modules
+    global G
 
     # Get line information
     lines = get_lines(img)
@@ -453,13 +431,14 @@ def build_relationships(img,mapping):
             if start_text and end_text:
                 G.add_edge(start_text,end_text)
                 break
-    print("[+] Obtained graph with [ {} ] nodes and [ {} ] edges".format(G.number_of_nodes(),G.number_of_edges()))
-    print("")
-    return G
+
+    print("\t[+] Obtained graph with [ {} ] nodes and [ {} ] edges".format(G.number_of_nodes(),G.number_of_edges()),end="\n\n")
+    return G.copy()
 
 def pipeline(directory):
     # Function that performs a set of operations stopping
     # at the type CHECKPOINT
+    global G
 
     images = os.listdir(directory)
 
@@ -480,22 +459,44 @@ def pipeline(directory):
         border_image = trim_meta(img)
 
         # Grab ECU mappings and the line colors in image
-        print("|")
-        print("|---> [*] Extracting Text")
-        ecu_map, _ = extract_text(border_image)
+        print("\t|---> [*] Extracting Text")
+        ecu_map = extract_text(border_image)
 
         # Build relationships based off lines
         lines_img = line_filter(border_image,color='lines')
         lines_img = cv2.cvtColor(lines_img, cv2.COLOR_GRAY2RGB)
 
-        print(5*" "+"|")
-        print(5*" "+"|---> [*] Building Relationships")
+        print("\t|---> [*] Building Relationships")
         graph = build_relationships(lines_img,ecu_map.copy())
         graphs.append(graph.copy())
 
         G.clear()
 
-    return graphs
+    # Concatenate page continuation lines
+    print("[*] Composing continued page graphs")
+    F = None
+    for i in range(0,len(graphs)-1):
+        print(5*" "+"|---> Page {} <--> Page {}".format(i,i+1))
+        g,h = (F,graphs[i+1]) if F != None else (graphs[i],graphs[i+1])
+
+        out_nodes = [n for n in g.nodes if "OUT-" in n]
+        next_in_nodes = [n for n in h.nodes if "IN-" in n]
+        next_in_nodes = next_in_nodes[:-1]
+        if len(out_nodes) != len(next_in_nodes):
+            print("")
+            print("[-] Length of OUT[{}] and IN[{}] nodes does not match".format(len(out_nodes),len(next_in_nodes)))
+            print("    returning all graphs")
+            return graphs
+
+        new_names = ["CONNECT-JUNCT-{}-{}".format(i,n) for n in range(0,len(next_in_nodes))]
+        mapping_out = dict(list(zip(out_nodes,new_names)))
+        mapping_in = dict(list(zip(next_in_nodes,new_names)))
+
+        G_ = nx.relabel_nodes(g,mapping_out)
+        H_ = nx.relabel_nodes(h,mapping_in)
+        F = nx.compose(G_,H_)
+
+    return F
     # Take all of the connections and perform any pre-processing
     # before storing in graph database
     # store_connections(all_connections)
@@ -798,8 +799,7 @@ def corners2_boxes(corners,circles=False):
         boxes.append(box)
 
     return boxes
-
-
+    
 
 def is_ascii(s):
     # Function that returns true if all characters
