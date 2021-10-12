@@ -34,7 +34,7 @@ neotime==1.7.4
 networkx==2.3
 notebook==6.0.0
 numpy==1.16.4
-opencv-contrib-python==4.1.0.25
+opencv-contrib-python==4.2.0.32
 pandocfilters==1.4.2
 parso==0.5.1
 pdf2image==1.6.0
